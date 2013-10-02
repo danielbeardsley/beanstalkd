@@ -24,6 +24,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
     "0123456789-+/;.$_()"
 
 #define CMD_PUT "put "
+#define CMD_WAITJOB "wait "
 #define CMD_PEEKJOB "peek "
 #define CMD_PEEK_READY "peek-ready"
 #define CMD_PEEK_DELAYED "peek-delayed"
@@ -50,6 +51,8 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 
 #define CONSTSTRLEN(m) (sizeof(m) - 1)
 
+
+#define CMD_WAITJOB_LEN CONSTSTRLEN(CMD_WAITJOB)
 #define CMD_PEEK_READY_LEN CONSTSTRLEN(CMD_PEEK_READY)
 #define CMD_PEEK_DELAYED_LEN CONSTSTRLEN(CMD_PEEK_DELAYED)
 #define CMD_PEEK_BURIED_LEN CONSTSTRLEN(CMD_PEEK_BURIED)
@@ -79,6 +82,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define MSG_DEADLINE_SOON "DEADLINE_SOON\r\n"
 #define MSG_TIMED_OUT "TIMED_OUT\r\n"
 #define MSG_DELETED "DELETED\r\n"
+#define MSG_DELETED_FMT "DELETED %"PRIu64"\r\n"
 #define MSG_RELEASED "RELEASED\r\n"
 #define MSG_BURIED "BURIED\r\n"
 #define MSG_KICKED "KICKED\r\n"
@@ -136,7 +140,8 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
 #define OP_QUIT 22
 #define OP_PAUSE_TUBE 23
 #define OP_JOBKICK 24
-#define TOTAL_OPS 25
+#define OP_WAITJOB 25
+#define TOTAL_OPS 26
 
 #define STATS_FMT "---\n" \
     "current-jobs-urgent: %u\n" \
@@ -145,6 +150,7 @@ size_t job_data_size_limit = JOB_DATA_SIZE_LIMIT_DEFAULT;
     "current-jobs-delayed: %u\n" \
     "current-jobs-buried: %u\n" \
     "cmd-put: %" PRIu64 "\n" \
+    "cmd-wait: %" PRIu64 "\n" \
     "cmd-peek: %" PRIu64 "\n" \
     "cmd-peek-ready: %" PRIu64 "\n" \
     "cmd-peek-delayed: %" PRIu64 "\n" \
@@ -273,6 +279,7 @@ static const char * op_names[] = {
     CMD_QUIT,
     CMD_PAUSE_TUBE,
     CMD_JOBKICK,
+    CMD_WAITJOB,
 };
 
 static job remove_buried_job(job j);
@@ -373,6 +380,27 @@ remove_waiting_conn(Conn *c)
     }
     return c;
 }
+
+static
+void notify_waiting_conns(job j) {
+
+   Conn *c = j->waitjob_conn;
+   Conn *prev_c;
+   while (c) {
+      if (j->r.state == Invalid) {
+         reply_line(c, STATE_SENDWORD, MSG_DELETED_FMT, j->r.id);
+      } else if(j->r.state == Buried) {
+         reply_line(c, STATE_SENDWORD, MSG_BURIED_FMT, j->r.id);
+      }
+
+      prev_c = c;
+      c = c->next_waitjob;
+      prev_c->next_waitjob = NULL;
+   }
+
+   j->waitjob_conn = NULL;
+}
+
 
 static void
 reserve_job(Conn *c, job j)
@@ -508,6 +536,8 @@ bury_job(Server *s, job j, char update_store)
         }
         walmaint(&s->wal);
     }
+
+    notify_waiting_conns(j);
 
     return 1;
 }
@@ -740,6 +770,7 @@ which_cmd(Conn *c)
 {
 #define TEST_CMD(s,c,o) if (strncmp((s), (c), CONSTSTRLEN(c)) == 0) return (o);
     TEST_CMD(c->cmd, CMD_PUT, OP_PUT);
+    TEST_CMD(c->cmd, CMD_WAITJOB, OP_WAITJOB);
     TEST_CMD(c->cmd, CMD_PEEKJOB, OP_PEEKJOB);
     TEST_CMD(c->cmd, CMD_PEEK_READY, OP_PEEK_READY);
     TEST_CMD(c->cmd, CMD_PEEK_DELAYED, OP_PEEK_DELAYED);
@@ -891,6 +922,7 @@ fmt_stats(char *buf, size_t size, void *x)
             get_delayed_job_ct(),
             global_stat.buried_ct,
             op_ct[OP_PUT],
+            op_ct[OP_WAITJOB],
             op_ct[OP_PEEKJOB],
             op_ct[OP_PEEK_READY],
             op_ct[OP_PEEK_DELAYED],
@@ -1008,6 +1040,18 @@ wait_for_job(Conn *c, int timeout)
 
     /* Set the pending timeout to the requested timeout amount */
     c->pending_timeout = timeout;
+
+    connwant(c, 'h'); // only care if they hang up
+    c->next = dirty;
+    dirty = c;
+}
+
+static void
+wait_for_job_state_change(Conn *c, job j)
+{
+    c->state = STATE_WAIT;
+    c->next_waitjob = j->waitjob_conn;
+    j->waitjob_conn = c;
 
     connwant(c, 'h'); // only care if they hang up
     c->next = dirty;
@@ -1253,6 +1297,22 @@ dispatch_cmd(Conn *c)
         maybe_enqueue_incoming_job(c);
 
         break;
+    case OP_WAITJOB:
+        errno = 0;
+        id = strtoull(c->cmd + CMD_WAITJOB_LEN, &end_buf, 10);
+        if (errno) return reply_msg(c, MSG_BAD_FORMAT);
+        op_ct[type]++;
+
+        j = peek_job(id);
+
+        if (!j) return reply(c, MSG_NOTFOUND, MSG_NOTFOUND_LEN, STATE_SENDWORD);
+
+        wait_for_job_state_change(c, j);
+
+        if (j->r.state == Buried) {
+           notify_waiting_conns(j);
+        }
+        break;
     case OP_PEEK_READY:
         /* don't allow trailing garbage */
         if (c->cmd_len != CMD_PEEK_READY_LEN + 2) {
@@ -1349,6 +1409,9 @@ dispatch_cmd(Conn *c)
         j->tube->stat.total_delete_ct++;
 
         j->r.state = Invalid;
+        if (j->waitjob_conn) {
+           notify_waiting_conns(j);
+        }
         r = walwrite(&c->srv->wal, j);
         walmaint(&c->srv->wal);
         job_free(j);
